@@ -1,0 +1,1127 @@
+# THIS COPY LIVES IN THE PUBLIC sem-content-updates REPOSITORY, AND IT IS THE ONLY WAY THE APP IS BUILT FOR FREE.
+#
+# The private source repository runs out of free GitHub Actions minutes; public repositories
+# get unlimited ones, Mac included. So the build runs here and fetches the private code with
+# SOURCE_TOKEN, a fine-grained token that can only READ sem-content-system. The source stays
+# private. Only this file and the build log are public. Everything below the two checkout steps
+# is .github/workflows/desktop.yml from the source repository, unchanged: keep them in step.
+#
+# Release: push a tag app-v<version> to THIS repository (the version must equal tauri.conf.json).
+# The finished files are published here, which is where installed apps already look for updates.
+
+name: Desktop app
+
+# Builds the background render app for Windows and for Mac, signs and
+# notarizes the Mac build with the Apple Developer ID certificate, and
+# publishes a draft release carrying the update file the installed app reads.
+#
+# Every secret, every step you have to do by hand, and what a run costs, is
+# written out in docs/RELEASING.md. Read that first; this file is the machine
+# half of it.
+#
+# THIS IS THE ONLY DESKTOP WORKFLOW
+# There used to be a second one at desktop/ci/release.yml, which triggered on
+# desktop-v* tags and told its reader to copy it into .github/workflows. Two
+# workflows both writing latest.json is the failure they each warned about, so
+# that file has been deleted and this one is the whole of it.
+#
+# WHY THIS DOES NOT RUN ON EVERY PUSH
+# A Mac runner minute costs $0.062 against $0.006 for Linux, so one Mac minute
+# eats roughly ten minutes of the monthly free allowance (rates read from
+# GitHub's own pricing reference on 2026-08-26). A signed and notarized
+# Mac build is a 15 to 30 minute job, and there are two of them: one per chip,
+# because which Mac this lands on is not known and is not going to be asked.
+# Running that on every commit would spend the whole month's allowance in a
+# couple of days for no benefit.
+# So: a tag builds everything and publishes, and a manual run builds whatever
+# you pick and publishes nothing.
+#
+# WHAT A RUN THAT PUBLISHES NOTHING IS ALLOWED TO DO
+# Everything except release. It needs no signing key, no Apple certificate and
+# no repository variables, and it will not stop because they are absent. That
+# matters today, because none of them are set, and "does this still compile"
+# is the question worth being able to ask before any of them exist. A run that
+# does publish is held to the whole list, because that one reaches Sem.
+
+on:
+  # Push a tag that starts with app-v and this builds both machines, signs,
+  # notarizes and creates a DRAFT release. Nothing reaches Sem's app until
+  # somebody presses Publish on that draft.
+  push:
+    tags:
+      - 'app-v*'
+
+  # Actions tab -> Desktop app -> Run workflow. Builds and hands the result
+  # back as a downloadable file. Creates no release and updates nobody.
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Which machines to build for. A Mac build costs about ten times a Windows one.'
+        type: choice
+        required: true
+        default: windows
+        options:
+          - windows
+          - mac
+          - both
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '24'
+  # Folders whose npm install has to already be on disk when the Tauri bundler
+  # runs, because the desktop app ships the render worker inside itself. If it
+  # turns out the app installs these on Sem's machine at first run instead,
+  # empty this line: worker/remotion is the Remotion renderer and it is the
+  # slowest install in the repository.
+  EXTRA_NPM_DIRS: 'worker worker/remotion'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Everything that can be checked without a build machine, checked on the
+  # cheapest runner there is, before a single expensive minute is spent.
+  #
+  # This job exists because of a specific failure: a workflow that names a
+  # folder or a secret that does not exist gets all the way onto a Mac runner,
+  # spends twenty minutes and real money, and then fails on something that was
+  # knowable in one second on Linux.
+  #
+  # It sorts what it finds into two piles, and the pile a thing lands in depends
+  # on whether this run is publishing:
+  #
+  #   problems   stop the run now. Structural: no app, unreadable settings, no
+  #              version, no identifier. A build could not succeed anyway.
+  #   later      would stop a release and do not stop this run. The update key,
+  #              the update address, the Apple certificate. A build without them
+  #              still compiles the code and still produces an installer to try.
+  #
+  # On a tag, everything in the second pile becomes a problem, because that run
+  # is the one that reaches Sem.
+  # ---------------------------------------------------------------------------
+  preflight:
+    name: Check everything before spending build minutes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      project_path: ${{ steps.look.outputs.project_path }}
+      src_tauri: ${{ steps.look.outputs.src_tauri }}
+      version: ${{ steps.look.outputs.version }}
+      publish: ${{ steps.look.outputs.publish }}
+      matrix: ${{ steps.look.outputs.matrix }}
+      # Whether this run has everything an update file needs: a public key in
+      # the settings, an address to serve it from, and the private key to sign
+      # it with. Nothing else in this workflow decides that.
+      updater_ready: ${{ steps.look.outputs.updater_ready }}
+      # What createUpdaterArtifacts is forced to for this run. See the step
+      # "Decide whether this build makes update files".
+      updater_artifacts: ${{ steps.look.outputs.updater_artifacts }}
+      # Whether there is an Apple certificate to put on the Mac runner, and
+      # whether there is also an Apple account to notarize with. Steps cannot
+      # read the secrets context in an `if:`, so they read these instead.
+      mac_signing: ${{ steps.look.outputs.mac_signing }}
+      mac_notarize: ${{ steps.look.outputs.mac_notarize }}
+
+    steps:
+      - name: Get the code (the private source, fetched with a read-only token)
+        uses: actions/checkout@v7
+        with:
+          repository: hustlecorex-wq/sem-content-system
+          ref: main
+          token: ${{ secrets.SOURCE_TOKEN }}
+
+      - name: Find the app and check its settings and secrets
+        id: look
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+          # github.event.inputs rather than inputs, because this workflow also
+          # runs on a tag push where there are no inputs at all. This form is
+          # simply empty then instead of being a context that may not exist.
+          INPUT_TARGET: ${{ github.event.inputs.target }}
+          # Optional. Set these two repository variables to publish the finished
+          # files into a different, public repository instead of this one. See
+          # "Where the update file lives" in docs/RELEASING.md for why that is
+          # usually necessary while this repository stays private.
+          RELEASE_OWNER: ${{ vars.RELEASE_OWNER }}
+          RELEASE_REPO: ${{ vars.RELEASE_REPO }}
+          # Set true to build signed but NOT notarized, when Apple's notary
+          # service is not answering. See the build step that reads it.
+          SKIP_NOTARIZE: ${{ vars.SKIP_NOTARIZE }}
+          # Only whether each secret is set, never its value.
+          HAS_RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN != '' }}
+          HAS_TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+          HAS_TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD != '' }}
+          HAS_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE != '' }}
+          HAS_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD != '' }}
+          HAS_APPLE_ID: ${{ secrets.APPLE_ID != '' }}
+          HAS_APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD != '' }}
+          HAS_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID != '' }}
+        run: |
+          cat > "$RUNNER_TEMP/preflight.cjs" <<'PREFLIGHT'
+          'use strict'
+          const fs = require('node:fs')
+          const path = require('node:path')
+
+          const DOCS = 'docs/RELEASING.md'
+          const problems = []
+          const later = []
+          const notes = []
+          const lines = []
+
+          function say(line) {
+            console.log(line)
+            lines.push(line)
+          }
+
+          function finish() {
+            const summary = process.env.GITHUB_STEP_SUMMARY
+            if (summary) fs.appendFileSync(summary, lines.join('\n') + '\n')
+            if (problems.length) {
+              console.error('')
+              console.error('Stopped before building anything. ' + problems.length + ' problem(s):')
+              for (const p of problems) console.error('  - ' + p)
+              console.error('')
+              console.error('All of these are explained in ' + DOCS + '.')
+              process.exit(1)
+            }
+          }
+
+          function out(key, value) {
+            const file = process.env.GITHUB_OUTPUT
+            if (file) fs.appendFileSync(file, key + '=' + value + '\n')
+            else console.log('[output] ' + key + '=' + value)
+          }
+
+          /* ---- 1. where is the app ------------------------------------ */
+
+          const SKIP = new Set(['node_modules', 'target', 'dist', 'coverage', 'spike'])
+          const found = []
+
+          function walk(dir, depth) {
+            if (depth > 4) return
+            let entries
+            try {
+              entries = fs.readdirSync(dir, { withFileTypes: true })
+            } catch (err) {
+              return
+            }
+            for (const entry of entries) {
+              if (!entry.isDirectory()) continue
+              if (SKIP.has(entry.name) || entry.name.startsWith('.')) continue
+              const full = path.join(dir, entry.name)
+              if (entry.name === 'src-tauri') {
+                if (fs.existsSync(path.join(full, 'tauri.conf.json'))) found.push(dir)
+                continue
+              }
+              walk(full, depth + 1)
+            }
+          }
+          walk('.', 0)
+
+          if (found.length === 0) {
+            say('### No desktop app in this checkout')
+            say('')
+            say('Looked for a folder named `src-tauri` holding a `tauri.conf.json`, up to four')
+            say('levels down, ignoring ' + [...SKIP].join(', ') + '.')
+            say('')
+            say('Nothing was found, so there is nothing to build. If the app has just been')
+            say('added, check that `src-tauri/` is not ignored by .gitignore: it has to be in')
+            say('the repository for a build machine to see it.')
+            problems.push('no src-tauri/tauri.conf.json anywhere in the checkout')
+            finish()
+            process.exit(1)
+          }
+
+          if (found.length > 1) {
+            say('### More than one desktop app found')
+            for (const f of found) say('- `' + f + '`')
+            problems.push('found ' + found.length + ' tauri apps, expected exactly one')
+            finish()
+            process.exit(1)
+          }
+
+          const projectPath = found[0].split(path.sep).join('/').replace(/^\.\/?/, '') || '.'
+          const srcTauri = projectPath === '.' ? 'src-tauri' : projectPath + '/src-tauri'
+          const confPath = srcTauri + '/tauri.conf.json'
+
+          /* ---- 2. read the settings ----------------------------------- */
+
+          let cfg
+          try {
+            cfg = JSON.parse(fs.readFileSync(confPath, 'utf8'))
+          } catch (err) {
+            problems.push(confPath + ' is not valid JSON: ' + err.message)
+            say('### Could not read ' + confPath)
+            finish()
+            process.exit(1)
+          }
+
+          const bundle = cfg.bundle || {}
+          const updater = (cfg.plugins || {}).updater || {}
+
+          let version = typeof cfg.version === 'string' ? cfg.version.trim() : ''
+          if (!version) {
+            const cargoPath = srcTauri + '/Cargo.toml'
+            if (fs.existsSync(cargoPath)) {
+              const text = fs.readFileSync(cargoPath, 'utf8')
+              const section = text.match(/\[package\]([\s\S]*?)(?=\n\[|$)/)
+              if (section) {
+                const m = section[1].match(/^\s*version\s*=\s*"([^"]+)"/m)
+                if (m) version = m[1]
+              }
+            }
+          }
+          if (!version) {
+            problems.push('no version in ' + confPath + ' and none in ' + srcTauri + '/Cargo.toml')
+            version = '0.0.0'
+          }
+
+          /* ---- 3. what are we building this time ---------------------- */
+
+          const eventName = process.env.EVENT_NAME || ''
+          const refType = process.env.REF_TYPE || ''
+          const refName = process.env.REF_NAME || ''
+          const publish = eventName === 'push' && refType === 'tag'
+          const want = publish ? 'both' : (process.env.INPUT_TARGET || 'windows')
+          const wantWindows = want === 'both' || want === 'windows'
+          const wantMac = want === 'both' || want === 'mac'
+
+          // The whole of the gating, in one function. A thing that has to be
+          // true before a release goes out, but that does not stop this run
+          // from proving the code compiles, goes in the second pile unless
+          // this run is the release.
+          function needsForRelease(message) {
+            if (publish) problems.push(message)
+            else later.push(message)
+          }
+
+          function has(name) {
+            return process.env['HAS_' + name] === 'true'
+          }
+
+          /* ---- 4. can this run produce a working update file ---------- */
+          //
+          // Three separate things, and all three have to be there. Missing any
+          // one of them produces an app that installs and can never replace
+          // itself, which is the failure this whole pipeline exists to avoid
+          // and the one that shows up months later.
+
+          if (!cfg.identifier) {
+            problems.push('no "identifier" in ' + confPath + '. Apple signs an identifier; without one there is nothing to sign')
+          } else if (cfg.identifier === 'com.tauri.dev') {
+            problems.push('"identifier" is still the example value com.tauri.dev. Change it to something owned, for example com.hustlecorex.semcontent')
+          }
+
+          const pubkeyOk = typeof updater.pubkey === 'string' && updater.pubkey.trim() !== ''
+          if (!pubkeyOk) {
+            needsForRelease(
+              'plugins.updater.pubkey is empty in ' + confPath + '. That is the public half of the update signing key. ' +
+              'It is deliberately empty in the repository: making the key is a hand step, and ' + DOCS + ' part 1 is how'
+            )
+          }
+
+          const endpoints = Array.isArray(updater.endpoints) ? updater.endpoints : []
+          if (endpoints.length === 0) {
+            needsForRelease(
+              'plugins.updater.endpoints is empty in ' + confPath + '. That is the address the installed app asks for new versions. ' +
+              'Which address it should be is the "Where the update file lives" decision in ' + DOCS
+            )
+          }
+          let endpointsOk = endpoints.length > 0
+          for (const endpoint of endpoints) {
+            if (typeof endpoint !== 'string' || !endpoint.startsWith('https://')) {
+              endpointsOk = false
+              needsForRelease('update address ' + JSON.stringify(endpoint) + ' is not an https address')
+            }
+          }
+
+          if (!has('TAURI_SIGNING_PRIVATE_KEY')) {
+            needsForRelease(
+              'the secret TAURI_SIGNING_PRIVATE_KEY is not set on this repository. It is the private half of the update ' +
+              'signing key and nothing can sign an update file without it. How to make it is in ' + DOCS
+            )
+          }
+          if (!has('TAURI_SIGNING_PRIVATE_KEY_PASSWORD')) {
+            notes.push('TAURI_SIGNING_PRIVATE_KEY_PASSWORD is not set, which is correct only if the update key was made without a password')
+          }
+
+          // Where the finished files are actually going to be published. By
+          // default this repository; the two variables move that elsewhere.
+          const repo = process.env.REPO || ''
+          const overrideOwner = (process.env.RELEASE_OWNER || '').trim()
+          const overrideRepo = (process.env.RELEASE_REPO || '').trim()
+          const usingOverride = overrideOwner !== '' && overrideRepo !== ''
+          const releaseRepo = usingOverride ? overrideOwner + '/' + overrideRepo : repo
+
+          if (usingOverride) {
+            notes.push('releases go to ' + releaseRepo + ', not to this repository')
+            if (!has('RELEASE_TOKEN')) {
+              needsForRelease(
+                'RELEASE_OWNER and RELEASE_REPO say to publish into ' + releaseRepo + ', but the secret RELEASE_TOKEN is not set. ' +
+                'The token a workflow gets by default can only write to its own repository'
+              )
+            }
+          } else if ((overrideOwner === '') !== (overrideRepo === '')) {
+            needsForRelease('only one of the variables RELEASE_OWNER and RELEASE_REPO is set. Set both or neither')
+          }
+
+          // The trap this check exists for: a private repository's release files
+          // are not downloadable without a login. An app pointed at one gets a
+          // 404 forever and silently never updates.
+          const privateFlag = process.env.REPO_PRIVATE
+          const isPrivate = privateFlag === 'true'
+          if (privateFlag !== 'true' && privateFlag !== 'false') {
+            notes.push('could not tell whether this repository is private, so the check on the update address was skipped')
+          }
+          for (const endpoint of endpoints) {
+            if (typeof endpoint !== 'string') continue
+            const prefix = 'https://github.com/'
+            if (!endpoint.startsWith(prefix)) continue
+            const rest = endpoint.slice(prefix.length).split('/')
+            if (rest.length < 2) continue
+            const pointsAt = rest[0] + '/' + rest[1]
+
+            if (isPrivate && !usingOverride && pointsAt === repo) {
+              endpointsOk = false
+              needsForRelease(
+                'the update address points at this repository\'s releases (' + endpoint + ') and this repository is private. ' +
+                'Release files in a private repository need a login to download, so the app would never see an update. ' +
+                'See "Where the update file lives" in ' + DOCS
+              )
+            } else if (pointsAt !== releaseRepo) {
+              endpointsOk = false
+              needsForRelease(
+                'the app looks for updates at ' + pointsAt + ' but this workflow publishes releases to ' + releaseRepo + '. ' +
+                'One of the two is wrong, and the app would never see the version it just built'
+              )
+            }
+          }
+
+          const updaterReady = pubkeyOk && endpointsOk && has('TAURI_SIGNING_PRIVATE_KEY')
+
+          // createUpdaterArtifacts is not a hand setting and nobody should have
+          // to remember it. It is forced to match what this run can actually
+          // do, because the two failure modes are both bad and both late:
+          //
+          //   on with no key   the bundler signs at the very END of the build,
+          //                    so a Mac runner spends twenty-five minutes and
+          //                    then fails on the one thing it never had.
+          //                    Measured here: tauri 2.11.4 does no early check.
+          //   off with a key   the release goes out with installers and no
+          //                    latest.json, and every installed app sees
+          //                    nothing, forever, with no error anywhere.
+          const wantsV1 = bundle.createUpdaterArtifacts === 'v1Compatible'
+          const artifacts = updaterReady ? (wantsV1 ? '"v1Compatible"' : 'true') : 'false'
+          if (wantsV1) {
+            notes.push('createUpdaterArtifacts is "v1Compatible", which works but is only meant for apps migrating from Tauri 1')
+          }
+          if (bundle.createUpdaterArtifacts === true && !updaterReady) {
+            notes.push(confPath + ' asks for update files, but this run has no way to sign them, so it is building without them')
+          }
+
+          /* ---- 5. the Mac half ---------------------------------------- */
+
+          const macSigning = has('APPLE_CERTIFICATE') && has('APPLE_CERTIFICATE_PASSWORD')
+          const skipNotarize = (process.env.SKIP_NOTARIZE || '').trim() === 'true'
+          const macNotarize =
+            !skipNotarize && macSigning && has('APPLE_ID') && has('APPLE_PASSWORD') && has('APPLE_TEAM_ID')
+
+          // Said loudly, because it is the difference between an app that opens
+          // on a double click and one that asks the person for permission first.
+          if (wantMac && skipNotarize) {
+            notes.push(
+              'SKIP_NOTARIZE is true, so the Mac build is SIGNED BUT NOT NOTARIZED. It installs and ' +
+              'runs, and macOS asks the person to allow it once on first launch. Unset that variable ' +
+              'to go back to a build Apple has vouched for'
+            )
+          }
+
+          if (wantMac) {
+            const appleSecrets = [
+              'APPLE_CERTIFICATE',
+              'APPLE_CERTIFICATE_PASSWORD',
+              'APPLE_ID',
+              'APPLE_PASSWORD',
+              'APPLE_TEAM_ID'
+            ]
+            for (const name of appleSecrets) {
+              if (skipNotarize && name.startsWith('APPLE_') && name !== 'APPLE_CERTIFICATE' && name !== 'APPLE_CERTIFICATE_PASSWORD') continue
+              if (!has(name)) {
+                needsForRelease('the secret ' + name + ' is not set on this repository. How to make it is in ' + DOCS)
+              }
+            }
+          }
+
+          if (wantMac) {
+            notes.push(
+              'the Mac is built twice, once on Apple Silicon and once on Intel, so it does not ' +
+              'matter which kind of Mac it is being installed on. One app for both chips is not ' +
+              'possible while the app carries ffmpeg, because npm installs Remotion\'s compositor ' +
+              'for the machine it runs on and prepare.mjs stages exactly one. Two builds is the ' +
+              'way round that, and it roughly doubles the Mac cost of a release'
+            )
+          }
+
+          // Staging is a separate step in this workflow and it has to exist,
+          // because src-tauri/resources is gitignored and the bundle lists a
+          // file from it. Said as a note rather than a problem: an app that
+          // does not carry a payload does not need it.
+          if (fs.existsSync(projectPath + '/scripts/prepare.mjs')) {
+            notes.push('scripts/prepare.mjs will stage Node, the render service and ffmpeg before the build')
+          } else {
+            notes.push('no scripts/prepare.mjs in ' + projectPath + ', so nothing is staged into the app before it is built')
+          }
+
+          const mac = bundle.macOS || {}
+          if (wantMac && mac.signingIdentity === '-') {
+            const message =
+              'bundle.macOS.signingIdentity is "-" in ' + confPath + ', which means sign it with nothing. ' +
+              'That overrides the Developer ID certificate and Sem gets the Gatekeeper block this whole workflow exists to avoid'
+            // A live problem when this run really is going to sign, because the
+            // check after the build would fail anyway and later is cheaper here.
+            if (macSigning) problems.push(message)
+            else needsForRelease(message)
+          }
+          if (wantMac && typeof mac.signingIdentity === 'string' && mac.signingIdentity !== '-') {
+            notes.push('bundle.macOS.signingIdentity is fixed in the settings file, so it wins over the certificate found on the runner')
+          }
+
+          /* ---- 6. does the tag match the app -------------------------- */
+
+          if (publish) {
+            const expected = 'app-v' + version
+            if (refName !== expected) {
+              problems.push(
+                'the tag is ' + refName + ' but the app says it is version ' + version + ', so the tag should be ' + expected + '. ' +
+                'Publishing these as one release would hand out a file whose version does not match its own name'
+              )
+            }
+          }
+
+          /* ---- 7. what we are going to do ----------------------------- */
+
+          const include = []
+          if (wantWindows) {
+            include.push({
+              os: 'windows-latest',
+              label: 'Windows',
+              args: '',
+              rust_targets: ''
+            })
+          }
+          if (wantMac) {
+            // TWO MAC ENTRIES, ONE PER CHIP, AND THAT IS THE WHOLE ANSWER TO
+            // "WHICH MAC DOES SEM HAVE".
+            //
+            // Nobody knows which he has and nobody is going to ask him, so the
+            // build stopped depending on the answer. Each runner builds for
+            // itself: no --target anywhere, because the machine IS the target.
+            //
+            // THIS USED TO SAY --target universal-apple-darwin AND THAT COULD
+            // NEVER HAVE WORKED. One app for both chips needs everything inside
+            // it to exist for both chips, and this app carries ffmpeg. ffmpeg
+            // comes out of Remotion's compositor package, npm installs only the
+            // one for the machine it is run on, and desktop/scripts/prepare.mjs
+            // maps exactly one package per machine: there is no
+            // universal-apple-darwin entry in it, so it stopped with "No
+            // Remotion compositor is mapped for universal-apple-darwin" before
+            // anything was compiled. Two real builds is what that leaves.
+            //
+            // Both halves already exist in prepare.mjs, which is why this costs
+            // one matrix entry rather than any new code: NODE_BUILD and
+            // COMPOSITOR each carry x86_64-apple-darwin and
+            // aarch64-apple-darwin, so an Intel runner stages Intel Node and
+            // Intel ffmpeg by asking rustc what it is running on.
+            //
+            // The two .dmg files are named by chip, so they cannot collide on
+            // one release, and latest.json gains a darwin-x86_64 key beside its
+            // darwin-aarch64 one, so an installed app of either kind updates
+            // itself from the same release. max-parallel: 1 below is what makes
+            // that safe: the second Mac reads the file the first one wrote.
+            include.push({
+              os: 'macos-latest',
+              label: 'Mac (Apple Silicon)',
+              args: '',
+              rust_targets: ''
+            })
+            // macos-13 was the Intel label for years and GitHub has retired it.
+            // macos-15-intel is the current one, read from actions/runner-images
+            // rather than remembered. If a run ever fails with "no runner
+            // matching the labels", that retirement has happened again and this
+            // line is what to change.
+            include.push({
+              os: 'macos-15-intel',
+              label: 'Mac (Intel)',
+              args: '',
+              rust_targets: ''
+            })
+          }
+
+          out('project_path', projectPath)
+          out('src_tauri', srcTauri)
+          out('version', version)
+          out('publish', publish ? 'true' : 'false')
+          out('matrix', JSON.stringify({ include }))
+          out('updater_ready', updaterReady ? 'true' : 'false')
+          out('updater_artifacts', artifacts)
+          out('mac_signing', macSigning ? 'true' : 'false')
+          out('mac_notarize', macNotarize ? 'true' : 'false')
+
+          say('### Desktop app preflight')
+          say('')
+          say('| | |')
+          say('| --- | --- |')
+          say('| App folder | `' + projectPath + '` |')
+          say('| Settings | `' + confPath + '` |')
+          say('| Version | ' + version + ' |')
+          say('| Building | ' + include.map((m) => m.label).join(', ') + ' |')
+          say('| Publishing a release | ' + (publish ? 'yes, as a draft on tag ' + refName : 'no, this run only hands the files back') + ' |')
+          say('| Update files | ' + (updaterReady ? 'yes, signed' : 'no, this build cannot update itself') + ' |')
+          if (wantMac) {
+            say('| Mac signing | ' + (macSigning ? 'yes, Developer ID' : 'no, the build will be unsigned') + ' |')
+            say('| Mac notarization | ' + (macNotarize ? 'yes' : 'no') + ' |')
+          }
+          if (endpoints.length) say('| Update address | `' + endpoints[0] + '` |')
+          if (notes.length) {
+            say('')
+            say('Worth knowing:')
+            for (const n of notes) say('- ' + n)
+          }
+          if (later.length) {
+            say('')
+            say('**Not ready to release, but not stopping this run.** This build proves the code')
+            say('compiles and hands back an installer to try. It is not something anyone can be')
+            say('given, and a tag would stop here instead of building:')
+            say('')
+            for (const l of later) say('- ' + l)
+          }
+          if (problems.length) {
+            say('')
+            say('**Stopped before building anything:**')
+            for (const p of problems) say('- ' + p)
+          }
+
+          finish()
+          PREFLIGHT
+          node "$RUNNER_TEMP/preflight.cjs"
+
+  # ---------------------------------------------------------------------------
+  # The build itself. One matrix, decided by preflight.
+  #
+  # max-parallel is 1 on purpose, and it matters more now there are three legs
+  # rather than two. Every machine uploads into the same release and every one
+  # rewrites the same latest.json update file. Run at the same time they can
+  # each read the file before the others have written it, and the last one wins
+  # with the other platforms missing. A release happens rarely; waiting is free
+  # and an update file that only lists one machine is not.
+  # ---------------------------------------------------------------------------
+  build:
+    name: ${{ matrix.label }}
+    needs: preflight
+    permissions:
+      # Needed to create the draft release and upload files to it.
+      contents: write
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.preflight.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    # A hung notarization would otherwise bill until GitHub's own six hour cap.
+    # An hour of a Mac runner is about $3.72, which is the most a stuck run can
+    # cost here.
+    timeout-minutes: 60
+
+    steps:
+      - name: Get the code (the private source, fetched with a read-only token)
+        uses: actions/checkout@v7
+        with:
+          repository: hustlecorex-wq/sem-content-system
+          ref: main
+          token: ${{ secrets.SOURCE_TOKEN }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            worker/package-lock.json
+            worker/remotion/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Empty on Windows. On Mac these two are what a universal app is made
+          # of: it is compiled once for each chip and the two are joined.
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Reuse the last Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '${{ needs.preflight.outputs.src_tauri }} -> target'
+          # A failed build still leaves most crates compiled. Keeping that saves
+          # the next attempt from starting from nothing, which on a Mac runner
+          # is the difference between a few minutes and a lot of money.
+          cache-on-failure: true
+
+      - name: Install what the app needs
+        shell: bash
+        env:
+          PROJECT_PATH: ${{ needs.preflight.outputs.project_path }}
+        run: |
+          set -euo pipefail
+
+          install_dir() {
+            local dir="$1"
+            if [ -f "$dir/package-lock.json" ]; then
+              echo "installing $dir from its lockfile"
+              ( cd "$dir" && npm ci )
+            elif [ -f "$dir/package.json" ]; then
+              echo "installing $dir (no lockfile, so npm install)"
+              ( cd "$dir" && npm install )
+            else
+              echo "$dir has no package.json, nothing to install"
+            fi
+          }
+
+          install_dir "$PROJECT_PATH"
+
+          for dir in ${EXTRA_NPM_DIRS:-}; do
+            if [ -d "$dir" ]; then
+              install_dir "$dir"
+            else
+              echo "$dir is not in this checkout, skipping"
+            fi
+          done
+
+      # -----------------------------------------------------------------------
+      # Whether this build produces the small signed files an installed app
+      # reads to find out there is a newer version.
+      #
+      # It is decided here rather than left to tauri.conf.json, and that is
+      # deliberate. The settings file says false, because false is the only
+      # value that builds on a machine with no signing key, and `npm run build`
+      # in desktop/ has to keep working for whoever is developing this. This
+      # step turns it on for exactly the runs that can sign, which preflight
+      # already worked out.
+      #
+      # --config takes a path to a JSON file and merges it over the settings.
+      # A file rather than a JSON string on the command line, because the string
+      # would have to survive being split into arguments by the action, and a
+      # path with no spaces in it cannot be split wrongly.
+      #
+      # The action reads this file too, so it knows what the build produced. It
+      # tries to read it as inline JSON first and prints
+      #   Couldn't parse --config flag as inline JSON. This error can be ignored
+      #   if it's a file path.
+      # before doing the right thing. It is a path. Ignore that line.
+      # -----------------------------------------------------------------------
+      - name: Decide whether this build makes update files
+        id: updater
+        shell: bash
+        env:
+          UPDATER_READY: ${{ needs.preflight.outputs.updater_ready }}
+          UPDATER_ARTIFACTS: ${{ needs.preflight.outputs.updater_artifacts }}
+        run: |
+          set -euo pipefail
+
+          OVERRIDE="$RUNNER_TEMP/updater-artifacts.json"
+          printf '{"bundle":{"createUpdaterArtifacts":%s}}' "$UPDATER_ARTIFACTS" > "$OVERRIDE"
+          echo "merging over the app's settings: $(cat "$OVERRIDE")"
+
+          if [ "$UPDATER_READY" = "true" ]; then
+            echo "This build makes signed update files."
+          else
+            echo "This build makes installers only, and the app it produces cannot update"
+            echo "itself. That is what happens when the update key, the public key or the"
+            echo "update address is missing. The run summary from preflight says which."
+          fi
+
+          echo "config=$OVERRIDE" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Mac signing.
+      #
+      # Before the step that puts things inside the app, not after, because
+      # prepare.mjs signs every executable it stages and it reads the identity
+      # this step writes. Apple's notary service walks the whole bundle and
+      # refuses anything unsigned inside it, and Tauri does not sign what it
+      # finds in resources.
+      #
+      # Skipped entirely when there is no certificate, which is what lets a
+      # manual Mac build happen before anybody has been to Apple. The result is
+      # an unsigned app that macOS will refuse to open without a right-click,
+      # and the step further down says so in the run summary rather than letting
+      # anyone think it is the real thing.
+      #
+      # The certificate arrives as one long line of base64 in a secret. It is
+      # turned back into a .p12, put into a keychain that exists only for this
+      # run, and the name Apple gave it is read back out and handed to the
+      # build. Reading the name off the certificate rather than storing it as a
+      # sixth secret means it cannot be typed in wrong.
+      #
+      # The keychain password is invented here and thrown away with the runner.
+      # Tauri's own documentation asks for it as a secret; there is nothing to
+      # protect, because the keychain lives about twenty minutes on a machine
+      # nobody else can reach.
+      # -----------------------------------------------------------------------
+      - name: Put the Apple certificate on the build machine
+        if: ${{ runner.os == 'macOS' && needs.preflight.outputs.mac_signing == 'true' }}
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          KEYCHAIN="$RUNNER_TEMP/desktop-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          CERT="$RUNNER_TEMP/certificate.p12"
+
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$CERT"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          # Stay unlocked for the whole build. A keychain that locks itself
+          # halfway through makes codesign wait for a password box that no one
+          # can click, and the job sits there until it times out.
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERT" -k "$KEYCHAIN" -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security default-keychain -s "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN"
+          rm -f "$CERT"
+
+          # Written to a file rather than piped, because a pipeline whose last
+          # command stops early can kill the whole step under `set -o pipefail`
+          # and the helpful message below would never print.
+          security find-identity -v -p codesigning "$KEYCHAIN" > "$RUNNER_TEMP/identities.txt" || true
+          IDENTITY="$(sed -n '/Developer ID Application/{s/.*"\(.*\)".*/\1/p;q;}' "$RUNNER_TEMP/identities.txt")"
+
+          if [ -z "$IDENTITY" ]; then
+            echo "The certificate in APPLE_CERTIFICATE is not a Developer ID Application certificate." >&2
+            echo "That is the only kind Apple will notarize for shipping outside the App Store." >&2
+            echo "What is in the keychain instead:" >&2
+            cat "$RUNNER_TEMP/identities.txt" >&2
+            echo "How to make the right one is in docs/RELEASING.md." >&2
+            exit 1
+          fi
+
+          echo "Signing as: $IDENTITY"
+          echo "APPLE_SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
+      # -----------------------------------------------------------------------
+      # Put Node, the render service and ffmpeg inside the app.
+      #
+      # THIS STEP WAS MISSING AND WITHOUT IT NOTHING COULD EVER HAVE BUILT.
+      # desktop/src-tauri/resources is in desktop/.gitignore, because it is
+      # about 600 MB of staged Node and renderer, so a fresh checkout does not
+      # have it. tauri.conf.json lists resources/manifest.json as a bundled
+      # resource, so `tauri build` stops with
+      #   resource path resources\manifest.json doesn't exist
+      # which is the build refusing to make an app with nothing inside it.
+      #
+      # `npm run build` in desktop/ runs this script and then tauri build. The
+      # action does not run that script: it finds the tauri CLI and runs
+      # `npm run tauri -- build`, which is the CLI on its own. So the staging
+      # has to happen here, as its own step.
+      #
+      # No --target. prepare.mjs asks rustc what machine it is on and stages for
+      # that, which is the same machine tauri is about to build for.
+      # -----------------------------------------------------------------------
+      - name: Put everything the app carries inside it
+        shell: bash
+        env:
+          PROJECT_PATH: ${{ needs.preflight.outputs.project_path }}
+        run: |
+          set -euo pipefail
+
+          if [ -f "$PROJECT_PATH/scripts/prepare.mjs" ]; then
+            ( cd "$PROJECT_PATH" && node scripts/prepare.mjs )
+          else
+            echo "$PROJECT_PATH has no scripts/prepare.mjs, so there is nothing to stage."
+          fi
+
+      # -----------------------------------------------------------------------
+      # The build. Tauri does the signing and the notarizing itself, from the
+      # environment below, and this action collects what comes out, uploads it
+      # to the release and writes the update file that the installed app reads.
+      #
+      # Every secret here is an empty string when it has not been set, which is
+      # how a run with none of them still builds. What that costs is stated
+      # loudly in the run summary rather than left to be discovered.
+      # -----------------------------------------------------------------------
+      - name: Build, sign, notarize
+        id: tauri
+        if: ${{ vars.SKIP_NOTARIZE != 'true' }}
+        uses: tauri-apps/tauri-action@v1
+        env:
+          # RELEASE_TOKEN only exists if releases are published into a different
+          # repository, which needs a token that can write there. Unset, this
+          # falls back to the one this workflow gets for its own repository.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+          # Signs the update files, on both machines. Separate from anything
+          # Apple: this is what proves to an already installed app that an
+          # update really came from us. Unused on a run where preflight decided
+          # there are no update files to sign.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+          # Apple. Ignored on the Windows machine. APPLE_SIGNING_IDENTITY is
+          # not here because the step above read it off the certificate and put
+          # it in the environment, and on a run with no certificate that step
+          # did not happen, so nothing is signed.
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: ${{ needs.preflight.outputs.project_path }}
+          args: ${{ matrix.args }} --config=${{ steps.updater.outputs.config }}
+
+          # Empty unless the two repository variables are set, in which case the
+          # release is created in that repository instead of this one.
+          owner: ${{ vars.RELEASE_OWNER }}
+          repo: ${{ vars.RELEASE_REPO }}
+
+          # WHICH COMMIT THE RELEASE HANGS OFF, AND WHY IT CANNOT BE THE DEFAULT.
+          # The action's own default is the SHA of the commit being built:
+          #   export const commitish = core.getInput('releaseCommitish') || context.sha
+          # That is right when the release is created in THIS repository and
+          # wrong the moment it is created in another one, because that SHA does
+          # not exist over there. GitHub rejects it, at the very end of a build
+          # that has already compiled and signed everything:
+          #   Validation Failed: {"resource":"Release","field":"target_commitish"}
+          # So when the two RELEASE_ variables send the release elsewhere, hang
+          # it off that repository's own default branch instead. Empty otherwise,
+          # which leaves the action's default alone.
+          releaseCommitish: ${{ vars.RELEASE_REPO != '' && 'main' || '' }}
+
+          # With a tag: upload into a draft release named after it. Without
+          # one: build only, upload nothing, tell nobody. That is what makes a
+          # manual run safe to use for testing.
+          tagName: ${{ needs.preflight.outputs.publish == 'true' && github.ref_name || '' }}
+          releaseName: 'Sem Content System __VERSION__'
+          releaseBody: |
+            On a Mac, download the .dmg, open it, and drag the app across.
+            On Windows, download the setup file and run it.
+
+            Already installed? Do nothing. The app finds this by itself.
+          releaseDraft: true
+          prerelease: false
+
+          # Prefer the setup .exe over the .msi for Windows updates. It is the
+          # one that can install itself quietly in the background.
+          updaterJsonPreferNsis: true
+
+          # Hand the files back on a manual run so they can be tried out. On a
+          # tag they are already on the release, and a second copy would only
+          # eat the account's file storage.
+          uploadWorkflowArtifacts: ${{ needs.preflight.outputs.publish != 'true' }}
+
+      # The same build with the Apple account variables ABSENT rather than
+      # empty. Set the repository variable SKIP_NOTARIZE to true to take this
+      # path: it signs with the Developer ID exactly as above and does not
+      # wait on Apple's notary service, which on 2026-09-09 sat on one app for
+      # 56 minutes and was killed by the job timeout. What it costs is the
+      # first launch: the app is signed but not notarized, so macOS asks the
+      # person to allow it once instead of just opening it.
+      - name: Build and sign, without waiting for Apple
+        id: tauri_plain
+        if: ${{ vars.SKIP_NOTARIZE == 'true' }}
+        uses: tauri-apps/tauri-action@v1
+        env:
+          # RELEASE_TOKEN only exists if releases are published into a different
+          # repository, which needs a token that can write there. Unset, this
+          # falls back to the one this workflow gets for its own repository.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+          # Signs the update files, on both machines. Separate from anything
+          # Apple: this is what proves to an already installed app that an
+          # update really came from us. Unused on a run where preflight decided
+          # there are no update files to sign.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+        with:
+          projectPath: ${{ needs.preflight.outputs.project_path }}
+          args: ${{ matrix.args }} --config=${{ steps.updater.outputs.config }}
+
+          # Empty unless the two repository variables are set, in which case the
+          # release is created in that repository instead of this one.
+          owner: ${{ vars.RELEASE_OWNER }}
+          repo: ${{ vars.RELEASE_REPO }}
+
+          # WHICH COMMIT THE RELEASE HANGS OFF, AND WHY IT CANNOT BE THE DEFAULT.
+          # The action's own default is the SHA of the commit being built:
+          #   export const commitish = core.getInput('releaseCommitish') || context.sha
+          # That is right when the release is created in THIS repository and
+          # wrong the moment it is created in another one, because that SHA does
+          # not exist over there. GitHub rejects it, at the very end of a build
+          # that has already compiled and signed everything:
+          #   Validation Failed: {"resource":"Release","field":"target_commitish"}
+          # So when the two RELEASE_ variables send the release elsewhere, hang
+          # it off that repository's own default branch instead. Empty otherwise,
+          # which leaves the action's default alone.
+          releaseCommitish: ${{ vars.RELEASE_REPO != '' && 'main' || '' }}
+
+          # With a tag: upload into a draft release named after it. Without
+          # one: build only, upload nothing, tell nobody. That is what makes a
+          # manual run safe to use for testing.
+          tagName: ${{ needs.preflight.outputs.publish == 'true' && github.ref_name || '' }}
+          releaseName: 'Sem Content System __VERSION__'
+          releaseBody: |
+            On a Mac, download the .dmg, open it, and drag the app across.
+            On Windows, download the setup file and run it.
+
+            Already installed? Do nothing. The app finds this by itself.
+          releaseDraft: true
+          prerelease: false
+
+          # Prefer the setup .exe over the .msi for Windows updates. It is the
+          # one that can install itself quietly in the background.
+          updaterJsonPreferNsis: true
+
+          # Hand the files back on a manual run so they can be tried out. On a
+          # tag they are already on the release, and a second copy would only
+          # eat the account's file storage.
+          uploadWorkflowArtifacts: ${{ needs.preflight.outputs.publish != 'true' }}
+
+      # -----------------------------------------------------------------------
+      # Proof, not hope. The entire point of the Apple membership is that Sem
+      # double-clicks and the app opens. These four checks are what that
+      # actually means, asked of the file that was just built:
+      #
+      #   codesign --verify   the signature is intact and covers everything
+      #   Authority           it was signed by Developer ID, not ad-hoc
+      #   spctl --assess      Gatekeeper itself says it would let this run
+      #   stapler validate    the notarization travels with the file
+      #
+      # spctl is the one that matters. It is the same assessment macOS makes on
+      # Sem's machine, and it fails for an app that was signed but not
+      # notarized. Which is why this only runs when the whole Apple set is
+      # present: with no certificate and no Apple account there is nothing to
+      # assess, and failing here would only stop a build that was never claiming
+      # to be releasable.
+      # -----------------------------------------------------------------------
+      - name: Check the Mac app really would open on his machine
+        if: ${{ runner.os == 'macOS' && needs.preflight.outputs.mac_notarize == 'true' }}
+        env:
+          ARTIFACT_PATHS: ${{ steps.tauri.outputs.artifactPaths || steps.tauri_plain.outputs.artifactPaths }}
+        run: |
+          set -euo pipefail
+
+          printf '%s' "$ARTIFACT_PATHS" > "$RUNNER_TEMP/artifacts.json"
+          APP="$(jq -r '[.[] | select(endswith(".app"))] | .[0] // ""' "$RUNNER_TEMP/artifacts.json")"
+          DMG="$(jq -r '[.[] | select(endswith(".dmg"))] | .[0] // ""' "$RUNNER_TEMP/artifacts.json")"
+
+          if [ -z "$APP" ] || [ ! -d "$APP" ]; then
+            echo "The build did not produce a .app to check. It made:" >&2
+            jq -r '.[]' "$RUNNER_TEMP/artifacts.json" >&2
+            exit 1
+          fi
+
+          echo "== the app =="
+          echo "$APP"
+
+          echo "== is the signature intact =="
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          echo "== who signed it =="
+          codesign --display --verbose=4 "$APP" 2>&1 | tee "$RUNNER_TEMP/codesign.txt"
+          if ! grep -q 'Authority=Developer ID Application' "$RUNNER_TEMP/codesign.txt"; then
+            echo "Signed, but not by a Developer ID Application certificate." >&2
+            echo "Apple will not notarize that, and Sem would get the block this exists to avoid." >&2
+            exit 1
+          fi
+
+          echo "== would Gatekeeper let it run =="
+          spctl --assess --type exec --verbose=4 "$APP"
+
+          echo "== is the notarization stapled to the file =="
+          # Stapling is what lets it open the first time with no internet. The
+          # ticket can sit on the app or on the disk image depending on how the
+          # bundler ordered its work, so either one counts. Neither one counting
+          # means notarization did not complete, and that does fail the job.
+          STAPLED=no
+          if xcrun stapler validate "$APP"; then STAPLED=yes; fi
+          if [ -n "$DMG" ] && [ -f "$DMG" ]; then
+            if xcrun stapler validate "$DMG"; then STAPLED=yes; fi
+          fi
+          if [ "$STAPLED" != "yes" ]; then
+            echo "Neither the app nor the disk image carries a stapled notarization ticket." >&2
+            echo "It would still open, but only with an internet connection on first launch." >&2
+            exit 1
+          fi
+
+          {
+            echo "### Mac build checked"
+            echo ""
+            echo "- signature intact"
+            echo "- signed by Developer ID Application"
+            echo "- Gatekeeper assessed it as safe to run"
+            echo "- notarization stapled to the file"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # A Mac build with no Apple secrets is a real build and a useless install.
+      # Saying so here is the difference between somebody knowing that and
+      # somebody sending Sem a file that greets him with "this app is damaged".
+      - name: Say plainly that this Mac build is not the one Sem gets
+        if: ${{ runner.os == 'macOS' && needs.preflight.outputs.mac_notarize != 'true' }}
+        run: |
+          {
+            echo "### This Mac build is not signed"
+            echo ""
+            echo "It compiled, and it is a real app, and macOS will refuse to open it."
+            echo "Do not send it to anyone. It exists to prove the code builds."
+            echo ""
+            echo "What is missing is in the preflight summary at the top of this run."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Take the certificate off the build machine
+        if: ${{ always() && runner.os == 'macOS' }}
+        run: |
+          security delete-keychain "$RUNNER_TEMP/desktop-signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/certificate.p12" || true
+
+      - name: What came out
+        if: always()
+        shell: bash
+        env:
+          ARTIFACT_PATHS: ${{ steps.tauri.outputs.artifactPaths || steps.tauri_plain.outputs.artifactPaths }}
+          RELEASE_URL: ${{ steps.tauri.outputs.releaseHtmlUrl || steps.tauri_plain.outputs.releaseHtmlUrl }}
+          UPDATER_READY: ${{ needs.preflight.outputs.updater_ready }}
+        run: |
+          {
+            echo "### ${{ matrix.label }}"
+            echo ""
+            if [ -n "${ARTIFACT_PATHS:-}" ]; then
+              echo '```'
+              printf '%s' "$ARTIFACT_PATHS" | tr ',' '\n' | tr -d '[]"'
+              echo '```'
+            else
+              echo "Nothing was produced."
+            fi
+            if [ "${UPDATER_READY:-}" != "true" ]; then
+              echo ""
+              echo "No update files were made, so an app installed from this build would never"
+              echo "find a newer version. docs/RELEASING.md part 1 is what fixes that."
+            fi
+            if [ -n "${RELEASE_URL:-}" ]; then
+              echo ""
+              echo "Draft release: $RELEASE_URL"
+              echo ""
+              echo "It is a draft. Nobody's app sees this version until it is published."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
