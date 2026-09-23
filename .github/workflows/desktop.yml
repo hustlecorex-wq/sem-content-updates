@@ -79,7 +79,12 @@ env:
   # turns out the app installs these on Sem's machine at first run instead,
   # empty this line: worker/remotion is the Remotion renderer and it is the
   # slowest install in the repository.
-  EXTRA_NPM_DIRS: 'worker worker/remotion'
+  #
+  # The '.' is the project root, and it is there because desktop/scripts/prepare.mjs runs
+  # npm run build:editor, which is vite, which lives in the root node_modules. Nothing
+  # installed it, so the first release built after the editor got its own build failed on
+  # 'vite: command not found' on all three machines.
+  EXTRA_NPM_DIRS: '. worker worker/remotion'
 
 jobs:
   # ---------------------------------------------------------------------------
